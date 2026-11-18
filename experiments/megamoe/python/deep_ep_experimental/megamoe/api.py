@@ -33,7 +33,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 10:
+    if getattr(extension, "api_protocol", None) != 11:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -61,7 +61,7 @@ def _check_fp4_weight_format(weight, name):
 class SymmBuffer:
     """Collective resource owner. All ranks construct/call/destroy in the same order.
 
-    num_experts is global; intermediate_hidden is the post-SwiGLU width.
+    num_experts is global; intermediate_hidden is the post-activation width.
     This Beta supports nonempty, same-BS calls and one in-flight operation per buffer.
     """
 
@@ -91,6 +91,7 @@ class SymmBuffer:
 
         self._backend_name = select_backend(group)
         urma = self._backend_name == "urma"
+        effective_topk_weights_type = 1 if activation == "gelu" else topk_weights_type
         error = None
         try:
             integer("num_experts", num_experts, 1, 16384)
@@ -106,10 +107,14 @@ class SymmBuffer:
             h_align, i_align = (256, 256) if urma else (64, 128)
             if hidden % h_align or intermediate_hidden % i_align:
                 raise ValueError(f"hidden must be divisible by {h_align}; intermediate_hidden by {i_align}")
+            if activation not in {"swiglu", "gelu"}:
+                raise ValueError("activation must be 'swiglu' or 'gelu'")
+            if mma_type == "fp4xfp4":
+                raise ValueError("A4W4 (mma_type='fp4xfp4') is not enabled")
+            if mma_type not in {"fp8xfp4", "fp8xfp8"}:
+                raise ValueError("mma_type must be fp8xfp4 or fp8xfp8")
             if urma and (size not in (4, 8, 16) or mma_type != "fp8xfp4"):
-                raise ValueError("URMA supports EP4/EP8/EP16 and routed FP8xFP4")
-            if activation != "swiglu" or mma_type not in {"fp8xfp4", "fp8xfp8"}:
-                raise ValueError("Only SwiGLU with FP8xFP4/FP8xFP8 is implemented; no BF16xBF16")
+                raise ValueError("URMA supports EP4/EP8/EP16 and routed FP8xFP4; EP32/TopK32 require MTE")
             if mma_type != "fp8xfp4" and num_shared_experts:
                 raise ValueError("Shared experts currently require FP8xFP4 weights")
             if num_experts % size or num_experts // size > 128:
@@ -130,13 +135,20 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
-            topk_weights_type,
+            effective_topk_weights_type,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
         capacity = int(
             ext.buffer_size(
-                size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, backend=self._backend_name, topk_weights_type=topk_weights_type
+                size,
+                num_experts // size,
+                num_max_tokens_per_rank,
+                num_topk,
+                hidden,
+                backend=self._backend_name,
+                topk_weights_type=effective_topk_weights_type,
+                mma_type=mma_type,
             )
         )
         self._lock = threading.Lock()
@@ -149,8 +161,9 @@ class SymmBuffer:
         self.num_max_tokens_per_rank, self.num_topk = num_max_tokens_per_rank, num_topk
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
+        self.activation = activation
         self.ranks_per_node = ranks_per_node
-        self.topk_weights_type = topk_weights_type
+        self.topk_weights_type = effective_topk_weights_type
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
@@ -169,9 +182,9 @@ class SymmBuffer:
             self._runtime.ensure_alive()
         if self.x is not None:
             return self
-        self.x = torch.empty(
-            (self.num_max_tokens_per_rank, self.hidden), dtype=torch.float8_e4m3fn, device=self._device
-        )
+        input_dtype = torch.uint8 if self.mma_type == "fp4xfp4" else torch.float8_e4m3fn
+        input_width = self.hidden // (2 if self.mma_type == "fp4xfp4" else 1)
+        self.x = torch.empty((self.num_max_tokens_per_rank, input_width), dtype=input_dtype, device=self._device)
         self.x_sf = torch.empty(
             (self.num_max_tokens_per_rank, self.hidden // 32), dtype=torch.float8_e8m0fnu, device=self._device
         )
@@ -210,6 +223,8 @@ class SymmBuffer:
             runtime.native.capacity,
             backend=self._backend_name,
             topk_weights_type=self.topk_weights_type,
+            activation=self.activation,
+            mma_type=self.mma_type,
         )
         self._plan_bs = bs
 
@@ -268,8 +283,10 @@ class SymmBuffer:
                 if tensor.device != self._device or tensor.dtype != dtype or tuple(tensor.shape) != shape:
                     raise ValueError(f"{name} must retain its buffer dtype/device/shape")
             if x is None:
+                input_dtype = torch.uint8 if self.mma_type == "fp4xfp4" else torch.float8_e4m3fn
+                input_width = self.hidden // (2 if self.mma_type == "fp4xfp4" else 1)
                 for name, tensor, dtype, shape in (
-                    ("x", self.x, torch.float8_e4m3fn, (self.num_max_tokens_per_rank, self.hidden)),
+                    ("x", self.x, input_dtype, (self.num_max_tokens_per_rank, input_width)),
                     ("x_sf", self.x_sf, torch.float8_e8m0fnu, (self.num_max_tokens_per_rank, self.hidden // 32)),
                 ):
                     if (
@@ -344,8 +361,8 @@ def transform_weights_for_mega_moe(
     import torch
     import torch_npu
 
-    if activation != "swiglu":
-        raise NotImplementedError("Only SwiGLU is supported")
+    if activation not in ("swiglu", "gelu"):
+        raise ValueError("activation must be 'swiglu' or 'gelu'")
     transformed = []
     for name, value in (("l1_weights", l1_weights), ("l2_weights", l2_weights)):
         weight, scale = _pair(value, name)
@@ -370,7 +387,7 @@ def transform_weights_for_mega_moe(
             raise ValueError(f"{name}: expected E8M0 scales {expected} or raw packed int32 [E,N,K/128]")
         scale = scale.contiguous()
         if weight.dtype == torch.uint8:
-            if name == "l1_weights" and not shared:
+            if name == "l1_weights" and not shared and activation == "swiglu":
                 if weight.shape[1] % 256:
                     raise ValueError("Routed FP4 GMM1 requires gate/up widths divisible by 128")
                 # 两种布局一次准备；独立存储并启用版本计数，禁止原地修改后两份权重失配。
@@ -416,8 +433,8 @@ def mega_moe(
 ):
     """Explicit-input convenience API; prefer fp8_fp4_mega_moe for DeepGEMM-style use.
 
-    x: BF16 [B,H], or (FP8 E4M3 [B,H], E8M0 [B,H/32]).
-    FP8 is copied into the original communication record, never dequantized/requantized.
+    x: BF16 [B,H] or (FP8 E4M3 [B,H], E8M0 [B,H/32]).
+    Prequantized codes are copied into the original communication record, never dequantized/requantized.
     Routed work uses the prefill scheduler; W4 shared strategy switches at B=256.
     No backward or graph guarantee yet.
     """
@@ -465,30 +482,41 @@ def _run(
         sw1, ss1 = _pair(shared_l1_weights, "shared_l1_weights")
         sw2, ss2 = _pair(shared_l2_weights, "shared_l2_weights")
         shared = (sw1, sw2, ss1, ss2)
-    clamp = normalize_clamp(activation_clamp)
     b = sym_buffer
+    if b.activation == "gelu" and activation_clamp is not None:
+        raise ValueError("activation_clamp is only defined for SwiGLU")
+    clamp = normalize_clamp(activation_clamp)
     urma = b._backend_name == "urma"
     if urma and scales is None:
         raise TypeError("URMA input requires (FP8 E4M3, E8M0 scales)")
-    if data.ndim != 2 or not 0 < data.shape[0] <= b.num_max_tokens_per_rank or data.shape[1] != b.hidden:
-        raise ValueError("x must be nonempty [BS,H] within the buffer capacity")
+    packed_fp4 = b.mma_type == "fp4xfp4" and scales is not None
+    expected_width = b.hidden // 2 if packed_fp4 else b.hidden
+    if data.ndim != 2 or not 0 < data.shape[0] <= b.num_max_tokens_per_rank or data.shape[1] != expected_width:
+        raise ValueError("x must be nonempty [BS,H] (or packed [BS,H/2]) within the buffer capacity")
     if data.device != b._device:
         raise ValueError("x must be on the buffer's creating device")
-    expected = (b.num_experts // b.group.size(), b.intermediate_hidden * 2)
+    expected_x_dtype = torch.uint8 if packed_fp4 else (torch.float8_e4m3fn if scales is not None else torch.bfloat16)
+    if data.dtype != expected_x_dtype:
+        raise TypeError("x dtype does not match the buffer activation precision")
+    expected = (b.num_experts // b.group.size(), b.intermediate_hidden * (1 if b.activation == "gelu" else 2))
     if tuple(w1.shape[:2]) != expected or tuple(topk_idx.shape) != (data.shape[0], b.num_topk):
         raise ValueError("Weight/routing shapes do not match the buffer configuration")
     if (shared[0].shape[0] if shared[0] is not None else 0) != b.num_shared_experts:
         raise ValueError("Shared expert count does not match the buffer configuration")
-    expected_dtype = torch.uint8 if b.mma_type == "fp8xfp4" else torch.float8_e4m3fn
+    expected_dtype = torch.uint8 if b.mma_type in {"fp8xfp4", "fp4xfp4"} else torch.float8_e4m3fn
     if w1.dtype != expected_dtype:
         raise TypeError("Weight dtype differs from buffer mma_type")
     prepared_inputs = ()
     if w1.dtype == torch.uint8:
-        fused = urma or data.shape[0] <= _extension().small_batch_max_tokens
+        fused = b.activation == "swiglu" and b.mma_type == "fp8xfp4" and (
+            urma or data.shape[0] <= _extension().small_batch_max_tokens
+        )
         if isinstance(l1_weights, _RoutedWeightPair):
+            if b.activation != "swiglu":
+                raise ValueError("GELU requires single-projection GMM1 weights prepared with activation='gelu'")
             prepared_inputs = (*l1_weights, *l1_weights._planar)
             w1, s1 = l1_weights.select(fused)
-        elif urma or not fused:
+        elif b.activation == "swiglu" and b.mma_type == "fp8xfp4" and (urma or not fused):
             raise ValueError(
                 "Prefill requires both prepared GMM1 layouts; call transform_weights_for_mega_moe "
                 "on raw ND weights and keep its returned l1 pair intact"
@@ -590,10 +618,14 @@ def fp8_fp4_mega_moe(
     timer is a fresh buffer.allocate_timer() for a separate diagnostic call.
     Routed weight placement follows sym_buffer.topk_weights_type; see README.
     """
-    if recipe != (1, 1, 32) or activation != "swiglu" or fast_math is not True:
-        raise NotImplementedError("Beta supports recipe=(1,1,32), SwiGLU, default math only")
+    if recipe != (1, 1, 32) or fast_math is not True:
+        raise NotImplementedError("Beta supports recipe=(1,1,32) and default math only")
+    if activation not in ("swiglu", "gelu"):
+        raise ValueError("activation must be 'swiglu' or 'gelu'")
     if not isinstance(sym_buffer, SymmBuffer):
         raise TypeError("sym_buffer must be this installation's MegaMoE SymmBuffer")
+    if activation != sym_buffer.activation:
+        raise ValueError("activation must match the SymmBuffer configuration")
     import torch
 
     sym_buffer._runtime.ensure_alive()

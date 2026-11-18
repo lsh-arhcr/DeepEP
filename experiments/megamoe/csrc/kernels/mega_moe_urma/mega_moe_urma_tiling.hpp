@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include "kernels/mega_moe_common/common/mega_moe_constants.hpp"
 
 namespace MegaMoeUrma {
 // Fixed descriptor/cache capacity. The active communicator is Config::world.
@@ -210,6 +211,7 @@ struct PackRound {
 
 struct Config {
     uint32_t topkWeightsType, dispatchScaleStride;
+    uint32_t activationMode = static_cast<uint32_t>(DEEPEP_MEGAMOE_IMPL_NAMESPACE::MegaMoeActMode::SWIGLU);
     uint32_t bs;
     uint32_t hidden;
     uint32_t intermediate;

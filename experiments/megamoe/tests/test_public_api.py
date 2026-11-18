@@ -4,6 +4,9 @@
 """Execute public wrappers using CPU storage doubles; this does not simulate the NPU kernel."""
 
 import contextlib
+from pathlib import Path
+import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -175,10 +178,14 @@ def backend(monkeypatch):
             capacity,
             backend="mte",
             topk_weights_type=0,
+            activation="swiglu",
+            mma_type="fp8xfp4",
         ):
             self.bs, self.workspace_bytes = example.shape[0], 4096
             self.backend = backend
             self.topk_weights_type = topk_weights_type
+            self.activation = activation
+            self.mma_type = mma_type
             self.local_experts = experts
             events.append(("prepare", self.bs))
             events.append(("plan_backend", backend))
@@ -227,7 +234,7 @@ def backend(monkeypatch):
                 timer.data[-1] = generation
             return output, Tensor(np.arange(self.local_experts) + 2, "int32")
 
-    def buffer_size(*args, backend="mte", topk_weights_type=0):
+    def buffer_size(*args, backend="mte", topk_weights_type=0, mma_type="fp8xfp4"):
         events.append(("buffer_size", args, backend))
         return 2 << 20
 
@@ -667,3 +674,301 @@ def test_route_weight_mode_reaches_plan(backend, mode):
 def test_invalid_route_weight_mode(backend, mode):
     with pytest.raises((ValueError, TypeError), match="topk_weights_type"):
         api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, topk_weights_type=mode)
+
+
+def gelu_weights():
+    _, second = weights()
+    first = (
+        Tensor(np.zeros((2, 256, 512)), "uint8"),
+        Tensor(np.full((2, 256, 16, 2), 127), "float8_e8m0fnu"),
+    )
+    first[0].npu_format = 50
+    return first, second
+
+
+def test_gelu_single_projection_and_forced_prequant_mode_reach_native(backend):
+    b = api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, activation="gelu")
+    try:
+        assert b.topk_weights_type == 1
+        b.prepare(17)
+        assert b._plan.activation == "gelu" and b._plan.topk_weights_type == 1
+        y = Tensor(np.zeros((17, 1024)), "bfloat16")
+        api.fp8_fp4_mega_moe(y, *gelu_weights(), b, activation="gelu")
+        assert any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
+        with pytest.raises(ValueError, match="must match"):
+            api.fp8_fp4_mega_moe(y, *gelu_weights(), b)
+        with pytest.raises(ValueError, match="activation_clamp"):
+            api.fp8_fp4_mega_moe(y, *gelu_weights(), b, activation="gelu", activation_clamp=0.2)
+    finally:
+        b.destroy()
+
+
+def test_gelu_weight_transform_keeps_one_planar_projection(backend):
+    raw = (
+        Tensor(np.zeros((1, 256, 64)), "uint8"),
+        Tensor(np.full((1, 256, 2, 2), 127), "float8_e8m0fnu"),
+    )
+    transformed = api.transform_weights_for_mega_moe(raw, raw, activation="gelu")
+    assert not isinstance(transformed[0], api._RoutedWeightPair)
+    assert sum(isinstance(event, tuple) and event[0] == "format_cast" for event in backend.events) == 2
+    for weight, _ in transformed:
+        assert weight.npu_format == 50
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "gelu"])
+def test_a8w8_activation_modes_reach_native(backend, activation):
+    b = api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, activation=activation, mma_type="fp8xfp8")
+    try:
+        first_width = 512 if activation == "swiglu" else 256
+        first = (
+            Tensor(np.zeros((2, first_width, 1024)), "float8_e4m3fn"),
+            Tensor(np.full((2, first_width, 16, 2), 127), "float8_e8m0fnu"),
+        )
+        second = (
+            Tensor(np.zeros((2, 1024, 256)), "float8_e4m3fn"),
+            Tensor(np.full((2, 1024, 4, 2), 127), "float8_e8m0fnu"),
+        )
+        b.topk_idx.data[:] = [0, 1]
+        b.topk_weights.data[:] = [0.4, 0.6]
+        y = Tensor(np.zeros((17, 1024)), "bfloat16")
+        api.fp8_fp4_mega_moe(y, first, second, b, activation=activation)
+        assert b._plan.mma_type == "fp8xfp8" and b._plan.activation == activation
+        assert b._plan.topk_weights_type == (1 if activation == "gelu" else 0)
+        assert any(isinstance(event, tuple) and event[0] == "launch" for event in backend.events)
+    finally:
+        b.destroy()
+
+
+def test_a4w4_public_configuration_remains_closed(backend):
+    with pytest.raises(ValueError, match="A4W4.*not enabled"):
+        api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, mma_type="fp4xfp4")
+
+
+@pytest.mark.parametrize("world", [8, 16, 32])
+@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8"])
+def test_mte_target_topology_topk25_reaches_plan_for_a8_modes(backend, world, mma_type):
+    b = api.SymmBuffer(
+        backend.group_type(world),
+        800,
+        39280,
+        25,
+        4096,
+        1536,
+        activation="gelu",
+        mma_type=mma_type,
+        ranks_per_node=min(world, 16),
+    )
+    try:
+        assert b.x.shape == (39280, 4096) and b.topk_idx.shape == (39280, 25)
+        b.prepare(39280)
+        assert b._plan.local_experts == 800 // world
+        assert b._plan.topk_weights_type == 1 and b._plan.mma_type == mma_type
+    finally:
+        b.destroy()
+
+
+def test_mte_topk32_boundary_and_invalid_activation_precision(backend):
+    b = api.SymmBuffer(backend.group_type(), 64, 17, 32, 1024, 256, activation="gelu")
+    assert b.topk_weights_type == 1
+    b.destroy()
+    with pytest.raises(ValueError, match="num_topk"):
+        api.SymmBuffer(backend.group_type(), 64, 17, 33, 1024, 256)
+    with pytest.raises(ValueError, match="activation"):
+        api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, activation="tanh")
+    with pytest.raises(ValueError, match="mma_type"):
+        api.SymmBuffer(backend.group_type(), 4, 17, 2, 1024, 256, mma_type="bf16xbf16")
+
+
+def test_urma_gelu_uses_single_planar_projection_within_existing_limits(backend, monkeypatch):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    b = api.SymmBuffer(backend.group_type(16), 32, 2048, 2, 256, 256, activation="gelu")
+    raw = (
+        (Tensor(np.zeros((2, 256, 128)), "uint8"), Tensor(np.full((2, 256, 4, 2), 127), "float8_e8m0fnu")),
+        (Tensor(np.zeros((2, 256, 128)), "uint8"), Tensor(np.full((2, 256, 4, 2), 127), "float8_e8m0fnu")),
+    )
+    prepared = api.transform_weights_for_mega_moe(*raw, activation="gelu")
+    try:
+        b.topk_idx.data[:] = [0, 1]
+        b.topk_weights.data[:] = [0.4, 0.6]
+        y = Tensor(np.zeros((17, 256)), "bfloat16")
+        api.fp8_fp4_mega_moe(y, *prepared, b, activation="gelu")
+        assert b._plan.backend == "urma" and b._plan.topk_weights_type == 1
+    finally:
+        b.destroy()
+
+
+def test_urma_unsafe_target_limits_remain_explicit(backend, monkeypatch):
+    from deep_ep_experimental.megamoe import backend as selector
+
+    monkeypatch.setattr(selector, "select_backend", lambda group: "urma")
+    for world, kwargs in (
+        (16, dict(num_experts=32, num_max_tokens_per_rank=17, num_topk=9)),
+        (16, dict(num_experts=32, num_max_tokens_per_rank=16385, num_topk=8)),
+        (32, dict(num_experts=64, num_max_tokens_per_rank=17, num_topk=8)),
+    ):
+        with pytest.raises(ValueError):
+            api.SymmBuffer(backend.group_type(world), hidden=256, intermediate_hidden=256, **kwargs)
+
+
+def test_shared_expert_activation_policy_matches_gmm2_tile_counts(tmp_path):
+    compiler = next((path for name in ("c++", "g++", "clang++") if (path := shutil.which(name))), None)
+    if compiler is None:
+        pytest.skip("A host C++17 compiler is required for the native policy regression")
+    csrc = Path(__file__).resolve().parents[1] / "csrc"
+    source = tmp_path / "shared_policy.cpp"
+    executable = tmp_path / ("shared_policy.exe" if sys.platform == "win32" else "shared_policy")
+    source.write_text(
+        r'''#include "kernels/mega_moe_common/common/mega_moe_shared_policy.hpp"
+#include <cstdint>
+#include <iostream>
+
+uint32_t Tiles(uint32_t hidden, uint32_t tileN)
+{
+    return (hidden + tileN - 1U) / tileN;
+}
+
+int main()
+{
+    const uint32_t batches[] = {1U, 17U, 256U, 257U};
+    const uint32_t hiddenSizes[] = {1024U, 4096U};
+    for (uint32_t bs : batches) {
+        for (uint32_t hidden : hiddenSizes) {
+            const auto geluProducer = MegaMoeImpl::SelectSharedExpertPolicyForActivation(true, true, 1U, bs);
+            const auto geluConsumer = MegaMoeImpl::SelectSharedExpertPolicyForActivation(true, true, 1U, bs);
+            if (geluProducer.gmm2TileN != 256U || geluConsumer.gmm2TileN != geluProducer.gmm2TileN ||
+                Tiles(hidden, geluProducer.gmm2TileN) != Tiles(hidden, geluConsumer.gmm2TileN)) {
+                std::cerr << "GELU producer/consumer mismatch at BS=" << bs << " H=" << hidden << '\n';
+                return 1;
+            }
+            const auto swigluProducer = MegaMoeImpl::SelectSharedExpertPolicyForActivation(true, false, 1U, bs);
+            const auto swigluConsumer = MegaMoeImpl::SelectSharedExpertPolicyForActivation(true, false, 1U, bs);
+            const uint32_t expectedN = bs <= 256U ? 224U : 256U;
+            if (swigluProducer.gmm2TileN != expectedN || swigluConsumer.gmm2TileN != expectedN ||
+                Tiles(hidden, swigluProducer.gmm2TileN) != Tiles(hidden, swigluConsumer.gmm2TileN)) {
+                std::cerr << "SwiGLU policy regression at BS=" << bs << " H=" << hidden << '\n';
+                return 2;
+            }
+        }
+    }
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [compiler, "-std=c++17", "-I", str(csrc), str(source), "-o", str(executable)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run([str(executable)], check=True, capture_output=True, text=True)
+    for relative in (
+        "kernels/mega_moe_common/common/mega_moe_gmm_common.hpp",
+        "kernels/mega_moe/stage/mega_moe_unpermute.hpp",
+    ):
+        assert "SelectSharedExpertPolicyForActivation(" in (csrc / relative).read_text(encoding="utf-8")
+
+
+def test_mte_wave_window_mapping_and_target_capacity(tmp_path):
+    compiler = next((path for name in ("c++", "g++", "clang++") if (path := shutil.which(name))), None)
+    if compiler is None:
+        pytest.skip("A host C++17 compiler is required for the native wave-window regression")
+    csrc = Path(__file__).resolve().parents[1] / "csrc"
+    source = tmp_path / "wave_window.cpp"
+    executable = tmp_path / ("wave_window.exe" if sys.platform == "win32" else "wave_window")
+    source.write_text(
+        r'''#include "kernels/mega_moe_common/common/mega_moe_wave_window.hpp"
+#include <cstdint>
+#include <iostream>
+#include <vector>
+
+struct Range {
+    uint64_t storageBegin;
+    uint64_t storageEnd;
+};
+
+bool Overlaps(Range a, Range b)
+{
+    return a.storageBegin < b.storageEnd && b.storageBegin < a.storageEnd;
+}
+
+int main()
+{
+    if (MegaMoeImpl::WaveWindowSlotCount(true, true) != 3U ||
+        MegaMoeImpl::WaveWindowSlotCount(true, false) != 2U ||
+        MegaMoeImpl::WaveWindowSlotCount(false, true) != 1U) {
+        return 6;
+    }
+    const uint32_t lengths[] = {1U, 255U, 256U, 257U, 1024U, 17U, 1024U, 31U, 256U, 511U};
+    const uint64_t maxRows = 100000U;
+    for (uint32_t slots : {2U, 3U}) {
+        const uint32_t groups = 4U;
+        const uint64_t storageRows = MegaMoeImpl::WaveWindowRowCapacity(maxRows, groups, slots);
+        if (storageRows != slots * 1024U) return 1;
+        std::vector<Range> ranges;
+        uint64_t logical = 0U;
+        for (uint32_t wave = 0U; wave < 8U; ++wave) {
+            const uint32_t length = lengths[wave];
+            const auto mapping = MegaMoeImpl::MakeWaveRowMapping(maxRows, storageRows, groups, slots, wave, logical);
+            const uint64_t begin = MegaMoeImpl::MapWaveRow(mapping, logical);
+            const uint64_t end = MegaMoeImpl::MapWaveRow(mapping, logical + length - 1U) + 1U;
+            if (begin != (wave % slots) * 1024U || end > storageRows || end - begin != length) {
+                std::cerr << "invalid wave mapping at wave=" << wave << " slots=" << slots << '\n';
+                return 2;
+            }
+            ranges.push_back({begin, end});
+            logical += length;
+        }
+        for (uint32_t wave = 1U; wave < ranges.size(); ++wave) {
+            const uint32_t previous = slots == 2U ? wave : wave - 1U;
+            for (uint32_t other = wave; other < ranges.size() && other <= wave + 1U; ++other) {
+                if (previous != other && Overlaps(ranges[previous], ranges[other])) {
+                    std::cerr << "in-flight overlap at wave=" << wave << " slots=" << slots << '\n';
+                    return 3;
+                }
+            }
+            if (slots == 3U && wave > 0U && wave + 1U < ranges.size() && Overlaps(ranges[wave], ranges[wave + 1U])) {
+                return 3;
+            }
+        }
+    }
+    const auto identity = MegaMoeImpl::MakeWaveRowMapping(1000U, 1000U, 4U, 3U, 9U, 777U);
+    if (identity.logicalStart != 0U || identity.storageStart != 0U || MegaMoeImpl::MapWaveRow(identity, 777U) != 777U) {
+        return 4;
+    }
+    constexpr uint64_t bytesPerRow = 4096U + 256U + 1536U + 48U + 32U + 3072U + 8192U;
+    for (uint32_t ep : {8U, 16U, 32U}) {
+        const uint64_t logicalRows = static_cast<uint64_t>(39280U) * ep * 25U;
+        const uint64_t fullBytes = logicalRows * bytesPerRow;
+        const uint64_t a8w4Rows = MegaMoeImpl::WaveWindowRowCapacity(logicalRows, 16U, 3U);
+        const uint64_t a8w8Rows = MegaMoeImpl::WaveWindowRowCapacity(logicalRows, 16U, 2U);
+        if (fullBytes < (100ULL << 30) || a8w4Rows != 12288U || a8w8Rows != 8192U ||
+            a8w4Rows * bytesPerRow >= (256ULL << 20) || a8w8Rows * bytesPerRow >= (256ULL << 20)) {
+            std::cerr << "target capacity regression at EP=" << ep << '\n';
+            return 5;
+        }
+    }
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [compiler, "-std=c++17", "-I", str(csrc), str(source), "-o", str(executable)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run([str(executable)], check=True, capture_output=True, text=True)
+    expected = {
+        "kernels/mega_moe_common/common/mega_moe_workspace.hpp": "MteWorkspaceRowCapacity",
+        "kernels/mega_moe/stage/mega_moe_token_dispatch.hpp": "MapWaveRow",
+        "kernels/mega_moe_common/stage/mega_moe_gmm1_activation.hpp": "ExpertStorageRow",
+        "kernels/mega_moe/stage/mega_moe_gmm2_combine.hpp": "ExpertStorageRow",
+        "kernels/mega_moe/mega_moe_wave_a8w4.hpp": "SyncAll<false>",
+        "kernels/mega_moe/mega_moe_wave_a8w8.hpp": "SyncAll<false>",
+    }
+    for relative, marker in expected.items():
+        assert marker in (csrc / relative).read_text(encoding="utf-8")
