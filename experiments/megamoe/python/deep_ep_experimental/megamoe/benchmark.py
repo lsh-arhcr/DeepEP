@@ -344,6 +344,14 @@ def run(args, config, group):
         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
         **{k: v for k, v in model.items() if k not in ("shared_intermediate_hidden", "shared_output_rounding", "activation_clamp")},
     )
+    if urma:
+        windows_by_bs = {bs: buffer.num_forward_windows(bs) for bs in config["bs_values"]}
+        manifest.update(
+            windows_per_forward_by_bs=windows_by_bs,
+            kernel_duration_scope="sum_of_window_kernels_per_forward",
+            timer_scope="first_window_only" if args.timer else "disabled",
+        )
+        (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     def device_pair(pair):
         data, scale = pair
@@ -539,11 +547,16 @@ def run(args, config, group):
                 guard=guard,
                 directory=case / "profiler",
                 fine_forward=(lambda: call(timer)) if args.timer else None,
+                windows_per_forward=windows_by_bs[bs],
             )
             (case / "kernel_samples.json").write_text(json.dumps(capture["samples"], indent=2), encoding="utf-8")
             per_rank = group.all_gather(capture["durations_us"], f"profiling BS={bs}")
             report = summarize_profile_rounds(per_rank, int(os.environ.get("LOCAL_WORLD_SIZE", world)))
-            report.update(includes_device_routing=True)
+            report.update(
+                includes_device_routing=True,
+                windows_per_forward=windows_by_bs[bs],
+                kernel_duration_scope=manifest["kernel_duration_scope"],
+            )
             (case / "performance.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         else:
             samples = collect_profile(call, group, torch, config, prefix, case / "profiler", bs)
